@@ -1,0 +1,389 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[2]:
+
+
+get_ipython().system('pip install py2neo ')
+
+
+# In[33]:
+
+
+from py2neo import Graph
+import pandas as pd
+
+import matplotlib
+import matplotlib.pyplot as plt
+
+plt.style.use('fivethirtyeight')
+pd.set_option('display.float_format', lambda x: '%3f' % x)
+
+import pandas as pd
+from collections import Counter
+from sklearn.ensemble import RandomForestClassifier
+
+from sklearn.metrics import recall_score
+from sklearn.metrics import precision_score
+from sklearn.metrics import accuracy_score
+
+
+# In[34]:
+
+
+graph = Graph("bolt://localhost", auth=("neo4j", "neo"))
+
+
+# In[5]:
+
+
+query = """
+MATCH (cr:Crashes) 
+WITH cr.Year AS year, count(*) AS count
+ORDER BY year
+RETURN toString(year) AS year, count
+"""
+by_year = graph.run(query).to_data_frame()
+
+ax = by_year.plot(kind='bar', x='year', y='count', legend=None, figsize=(15,8))
+ax.xaxis.set_label_text("")
+plt.tight_layout()
+plt.show()
+
+
+# In[6]:
+
+
+query = """
+MATCH (cr:Crashes)-[r]-(inf:InF_Factor)
+WITH inf.Weather AS wh, count(*) AS count
+ORDER BY count
+RETURN wh AS wh, count
+"""
+by_cond = graph.run(query).to_data_frame()
+
+ax = by_cond.plot(kind='bar', x='wh', y='count', legend=None, figsize=(15,8))
+ax.xaxis.set_label_text("")
+plt.tight_layout()
+plt.show()
+
+
+# In[10]:
+
+
+query = """
+MATCH (int1)<-[:LOCATED_AT]-(cr: Crashes)-[:LOCATED_AT]->(int2:Streets)
+WITH int1, cr, int2
+ORDER BY int1, cr.Year
+WITH int1, int2, collect(cr)[0].Year AS year, count(*) AS colocation
+MERGE (int1)-[Co:Colocation {Year: year}]-(int2)
+SET Co.colocation = colocation;
+"""
+
+graph.run(query).stats()
+
+
+# In[11]:
+
+
+query = """
+MATCH (int1)<-[:LOCATED_AT]-(cr: Crashes)-[:LOCATED_AT]->(int2:Streets)
+WITH int1, cr, int2
+ORDER BY int1, cr.Year
+WITH int1, int2, collect(cr)[0].Year AS year, count(*) AS colocation
+WHERE year < 2014
+MERGE (int1)-[Co:Colocation_Early {Year: year}]-(int2)
+SET Co.colocation = colocation;
+"""
+
+graph.run(query).stats()
+
+
+# In[12]:
+
+
+query = """
+MATCH (int1)<-[:LOCATED_AT]-(cr: Crashes)-[:LOCATED_AT]->(int2:Streets)
+WITH int1, cr, int2
+ORDER BY int1, cr.Year
+WITH int1, int2, collect(cr)[0].Year AS year, count(*) AS colocation
+WHERE year >= 2014
+MERGE (int1)-[Co:Colocation_Late {Year: year}]-(int2)
+SET Co.colocation = colocation;
+"""
+
+graph.run(query).stats()
+
+
+# In[13]:
+
+
+query = """
+MATCH ()-[:Colocation_Late]->()
+RETURN count(*) AS count
+"""
+
+graph.run(query).to_data_frame()
+
+
+# In[14]:
+
+
+query = """
+MATCH ()-[:Colocation_Early]->()
+RETURN count(*) AS count
+"""
+
+graph.run(query).to_data_frame()
+
+
+# In[15]:
+
+
+def down_sample(df):
+    copy = df.copy()
+    zero = Counter(copy.label.values)[0]
+    un = Counter(copy.label.values)[1]
+    n = zero - un
+    copy = copy.drop(copy[copy.label == 0].sample(n=n, random_state=1).index)
+    return copy.sample(frac=1)
+
+
+# In[24]:
+
+
+train_existing_links = graph.run("""
+MATCH (int:Intersections)-[:Colocation_Early]->(other:Streets)
+RETURN id(int) AS node1, id(other) AS node2, 1 AS label
+""").to_data_frame()
+
+train_missing_links = graph.run("""
+MATCH (int:Intersections)
+WHERE (int)-[:Colocation_Early]-()
+MATCH (int)-[:Colocation_Early*2..3]-(other)
+WHERE not((int)-[:Colocation_Early]-(other))
+RETURN id(int) AS node1, id(other) AS node2, 0 AS label
+""").to_data_frame()
+train_missing_links = train_missing_links.drop_duplicates()
+
+
+# In[26]:
+
+
+train_missing_links.head()
+
+
+# In[27]:
+
+
+training_df = train_missing_links.append(train_existing_links, ignore_index=True)
+training_df['label'] = training_df['label'].astype('category')
+training_df = down_sample(training_df)
+
+
+# In[28]:
+
+
+training_df.head()
+
+
+# In[29]:
+
+
+test_existing_links = graph.run("""
+MATCH (int:Intersections)-[:Colocation_Late]->(other:Streets)
+RETURN id(int) AS node1, id(other) AS node2, 1 AS label
+""").to_data_frame()
+
+test_missing_links = graph.run("""
+MATCH (int:Intersections)
+WHERE (int)-[:Colocation_Late]-()
+MATCH (int)-[:Colocation_Late*2..3]-(other)
+WHERE not((int)-[:Colocation_Late]-(other))
+RETURN id(int) AS node1, id(other) AS node2, 0 AS label
+""").to_data_frame()
+test_missing_links = test_missing_links.drop_duplicates()
+
+
+# In[30]:
+
+
+test_df = test_missing_links.append(test_existing_links, ignore_index=True)
+test_df['label'] = test_df['label'].astype('category')
+test_df = down_sample(test_df)
+
+
+# In[31]:
+
+
+test_df.head()
+
+
+# In[32]:
+
+
+classifier = RandomForestClassifier(n_estimators=30, max_depth=10, random_state=0)
+
+
+# In[35]:
+
+
+def apply_graphy_features(data, rel_type):
+    query = """
+    UNWIND $pairs AS pair
+    MATCH (p1) WHERE id(p1) = pair.node1
+    MATCH (p2) WHERE id(p2) = pair.node2
+    RETURN pair.node1 AS node1,
+           pair.node2 AS node2,
+           algo.linkprediction.commonNeighbors(
+               p1, p2, {relationshipQuery: $relType}) AS cn,
+           algo.linkprediction.preferentialAttachment(
+               p1, p2, {relationshipQuery: $relType}) AS pa,
+           algo.linkprediction.totalNeighbors(
+               p1, p2, {relationshipQuery: $relType}) AS tn
+    """
+    pairs = [{"node1": node1, "node2": node2}  for node1,node2 in data[["node1", "node2"]].values.tolist()]
+    features = graph.run(query, {"pairs": pairs, "relType": rel_type}).to_data_frame()
+    return pd.merge(data, features, on = ["node1", "node2"])
+
+
+# In[36]:
+
+
+training_df = apply_graphy_features(training_df, "Colocation_Early")
+
+
+# In[37]:
+
+
+training_df.head()
+
+
+# In[38]:
+
+
+
+test_df = apply_graphy_features(test_df, "Colocation_Late")
+
+
+# In[39]:
+
+
+test_df.head()
+
+
+# In[40]:
+
+
+columns = ["cn"]
+
+X = training_df[columns]
+y = training_df["label"]
+classifier.fit(X, y)
+
+predictions = classifier.predict(test_df[columns])
+y_test = test_df["label"]
+
+display("Accuracy", accuracy_score(y_test, predictions))
+display("Precision", precision_score(y_test, predictions))
+display("Recall", recall_score(y_test, predictions))
+
+sorted(list(zip(columns, classifier.feature_importances_)), key = lambda x: x[1]*-1)
+
+
+# In[41]:
+
+
+columns = ["cn", "pa", "tn"]
+
+X = training_df[columns]
+y = training_df["label"]
+classifier.fit(X, y)
+
+predictions = classifier.predict(test_df[columns])
+y_test = test_df["label"]
+
+display("Accuracy", accuracy_score(y_test, predictions))
+display("Precision", precision_score(y_test, predictions))
+display("Recall", recall_score(y_test, predictions))
+
+sorted(list(zip(columns, classifier.feature_importances_)), key = lambda x: x[1]*-1)
+
+
+# In[42]:
+
+
+graph.run("""
+CALL algo.triangleCount('Intersections', 'Colocation_Early', { write:true,
+writeProperty:'trianglesTrain', clusteringCoefficientProperty:'coefficientTrain'});
+""").to_data_frame()
+
+
+# In[43]:
+
+
+graph.run("""
+CALL algo.triangleCount('Intersections', 'Colocation_Late', { write:true,
+writeProperty:'trianglesTrain', clusteringCoefficientProperty:'coefficientTrain'});
+""").to_data_frame()
+
+
+# In[46]:
+
+
+def apply_triangles_features(data, triangles_prop, coefficient_prop):
+    query = """
+    UNWIND $pairs AS pair
+    MATCH (p1) WHERE id(p1) = pair.node1
+    MATCH (p2) WHERE id(p2) = pair.node2
+    RETURN pair.node1 AS node1,
+    pair.node2 AS node2,
+    apoc.coll.min([p1[$trianglesProp], p2[$trianglesProp]]) AS minTriangles,
+    apoc.coll.max([p1[$trianglesProp], p2[$trianglesProp]]) AS maxTriangles,
+    apoc.coll.min([p1[$coefficientProp], p2[$coefficientProp]]) AS minCoefficient,
+    apoc.coll.max([p1[$coefficientProp], p2[$coefficientProp]]) AS maxCoefficient
+    """
+    pairs = [{"node1": node1, "node2": node2}  for node1,node2 in data[["node1", "node2"]].values.tolist()]
+    params = {
+    "pairs": pairs,
+    "trianglesProp": triangles_prop,
+    "coefficientProp": coefficient_prop
+    }
+    features = graph.run(query, params).to_data_frame()
+    return pd.merge(data, features, on = ["node1", "node2"])
+
+
+# In[49]:
+
+
+graph.run("""
+CALL algo.labelPropagation("Intersections", "Colocation_Early", "BOTH",
+{partitionProperty: "partitionTrain"});
+""").to_data_frame()
+
+
+# In[50]:
+
+
+graph.run("""
+CALL algo.labelPropagation("Intersections", "Colocation_Late", "BOTH",
+{partitionProperty: "partitionTrain"});
+""").to_data_frame()
+
+
+# In[51]:
+
+
+graph.run("""
+CALL algo.louvain.stream("Intersections", "Colocation_Early", {includeIntermediateCommunities:true})
+YIELD nodeId, community, communities
+WITH algo.getNodeById(nodeId) AS node, communities[0] AS smallestCommunity
+SET node.louvainTrain = smallestCommunity;
+""").stats()
+
+
+# In[ ]:
+
+
+
+
